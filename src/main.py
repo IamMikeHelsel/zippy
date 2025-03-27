@@ -2,6 +2,7 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
+import concurrent.futures
 import logging
 import zipfile
 import psutil
@@ -28,6 +29,9 @@ class ZipApp(ctk.CTk):
         # Operation control
         self.cancel_event = threading.Event()
         self.current_task_thread = None
+        
+        # Thread pool for parallel operations
+        self.executor = None
 
         self.source_path = ctk.StringVar()
         self.target_zip_path = ctk.StringVar()
@@ -185,6 +189,10 @@ class ZipApp(ctk.CTk):
                 self.destroy()
         else:
             self.destroy()
+            
+        # Clean up thread pool if it exists
+        if self.executor:
+            self.executor.shutdown(wait=False)
 
     def update_resource_display(self):
         """Update the resource monitor display."""
@@ -381,7 +389,15 @@ class ZipApp(ctk.CTk):
                 self.after(0, self.update_resource_display)
                 
                 # Run the task with progress callback and cancel event
-                task_func(*args, progress_callback=self.update_progress, cancel_event=self.cancel_event)
+                if task_func.__name__ == "compress_item" and ";" in args[0]:
+                    # If there are multiple files to compress, handle them with the thread pool
+                    self._run_parallel_compression(args[0], args[1])
+                elif task_func.__name__ == "uncompress_archive" and Path(args[0]).exists():
+                    # Handle parallel decompression for zip archives
+                    self._run_parallel_decompression(args[0], args[1])
+                else:
+                    # Normal single-file operation
+                    task_func(*args, progress_callback=self.update_progress, cancel_event=self.cancel_event)
                 
                 # Only mark as complete if not cancelled
                 if not self.cancel_event.is_set():
@@ -435,16 +451,14 @@ class ZipApp(ctk.CTk):
                 # Reference cleanup
                 self.current_task_thread = None
                 
+                # Shutdown thread pool if it exists
+                if self.executor:
+                    self.executor.shutdown(wait=False)
+                    self.executor = None
+                
                 # Reset output label if compression was successful
                 if success and task_func.__name__ == "compress_item":
                     self.after(0, lambda: self.update_output_label())
-
-        # Disable buttons during operation
-        self.update_button_states(operation_running=True)
-
-        # Start the task thread
-        self.current_task_thread = threading.Thread(target=task_wrapper, daemon=True)
-        self.current_task_thread.start()
 
     def start_compression(self):
         """Starts the compression process in a new thread."""
@@ -493,6 +507,210 @@ class ZipApp(ctk.CTk):
         self.update_status("Starting uncompression...")
         self._run_task(core.uncompress_archive, source, target)
 
+    def _run_parallel_compression(self, source_paths_str, output_zip):
+        """
+        Process multiple files in parallel using a thread pool.
+        
+        Args:
+            source_paths_str: Semicolon-separated string of file paths
+            output_zip: Path to the output zip file
+        """
+        source_paths = source_paths_str.split(';')
+        num_workers = min(os.cpu_count() or 4, len(source_paths))
+        
+        self.update_status(f"Starting parallel compression with {num_workers} workers...")
+        
+        # Create a temporary directory for individual zip files
+        temp_dir = Path(output_zip).parent / f"temp_zip_{int(time.time())}"
+        temp_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Create a thread pool
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+            
+            # Function to compress a single file
+            def compress_single_file(file_path):
+                if self.cancel_event.is_set():
+                    return None
+                
+                file_name = Path(file_path).name
+                temp_zip = temp_dir / f"{file_name}.zip"
+                
+                try:
+                    # Compress the individual file
+                    core.compress_item(file_path, str(temp_zip))
+                    return temp_zip
+                except Exception as e:
+                    logger.error(f"Error compressing {file_path}: {e}")
+                    return None
+            
+            # Submit all compression tasks
+            future_to_path = {self.executor.submit(compress_single_file, path): path for path in source_paths}
+            
+            # Track progress
+            total_files = len(source_paths)
+            completed_files = 0
+            
+            # Process as they complete
+            temp_zips = []
+            for future in concurrent.futures.as_completed(future_to_path):
+                if self.cancel_event.is_set():
+                    # Cancel all pending tasks
+                    for f in future_to_path:
+                        f.cancel()
+                    break
+                
+                # Get the result (path to temp zip file)
+                source_path = future_to_path[future]
+                try:
+                    temp_zip = future.result()
+                    if temp_zip:
+                        temp_zips.append(temp_zip)
+                except Exception as e:
+                    logger.error(f"Error processing {source_path}: {e}")
+                
+                # Update progress
+                completed_files += 1
+                self.update_progress(completed_files, total_files)
+            
+            if self.cancel_event.is_set():
+                raise InterruptedError("Operation cancelled")
+            
+            # If we have temp zip files, merge them into the final zip
+            if temp_zips and not self.cancel_event.is_set():
+                self.update_status("Merging individual archives...")
+                self._merge_zip_files(temp_zips, output_zip)
+                
+            # Ensure 100% progress
+            if not self.cancel_event.is_set():
+                self.update_progress(total_files, total_files)
+                
+        finally:
+            # Clean up temp directory
+            try:
+                if temp_dir.exists():
+                    for file in temp_dir.iterdir():
+                        try:
+                            file.unlink()
+                        except:
+                            pass
+                    temp_dir.rmdir()
+            except Exception as e:
+                logger.error(f"Error cleaning up temp directory: {e}")
+    
+    def _merge_zip_files(self, zip_files, output_zip):
+        """
+        Merge multiple zip files into a single zip file.
+        
+        Args:
+            zip_files: List of Path objects to individual zip files
+            output_zip: Path to the final output zip file
+        """
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as outzip:
+            for zip_file in zip_files:
+                if self.cancel_event.is_set():
+                    break
+                    
+                if not zip_file.exists():
+                    continue
+                    
+                try:
+                    with zipfile.ZipFile(zip_file, 'r') as inzip:
+                        for file_info in inzip.infolist():
+                            if self.cancel_event.is_set():
+                                break
+                                
+                            with inzip.open(file_info) as file:
+                                outzip.writestr(file_info.filename, file.read())
+
+    def _run_parallel_decompression(self, zip_path, extract_dir):
+        """
+        Extract a zip archive using multiple threads for better performance.
+        
+        Args:
+            zip_path: Path to the zip archive
+            extract_dir: Directory to extract files to
+        """
+        # Create extraction directory if it doesn't exist
+        extract_path = Path(extract_dir)
+        extract_path.mkdir(parents=True, exist_ok=True)
+        
+        # Check if the archive exists
+        if not Path(zip_path).exists():
+            raise FileNotFoundError(f"Archive not found: {zip_path}")
+        
+        # First, analyze the zip file
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zipf:
+                members = zipf.infolist()
+                
+                # If there are too few files, use the standard extraction method
+                if len(members) < 5:
+                    core.uncompress_archive(zip_path, extract_dir, 
+                                          progress_callback=self.update_progress, 
+                                          cancel_event=self.cancel_event)
+                    return
+                    
+                total_files = len(members)
+                self.update_status(f"Preparing to extract {total_files} files in parallel...")
+                
+                # Determine optimal number of workers (don't exceed the number of files or CPU cores)
+                num_workers = min(os.cpu_count() or 4, total_files, 8)  # Cap at 8 workers maximum
+                self.update_status(f"Extracting with {num_workers} parallel workers...")
+                
+                # Create the thread pool
+                self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+                
+                # Function to extract a single file from the archive
+                def extract_member(member_info):
+                    if self.cancel_event.is_set():
+                        return False
+                        
+                    try:
+                        with zipfile.ZipFile(zip_path, 'r') as zipf:
+                            zipf.extract(member_info, path=extract_dir)
+                        return True
+                    except Exception as e:
+                        logger.error(f"Error extracting {member_info.filename}: {e}")
+                        return False
+                
+                # Submit extraction tasks for all files
+                future_to_member = {self.executor.submit(extract_member, member): member for member in members}
+                
+                # Track progress
+                extracted_files = 0
+                
+                # Process as they complete
+                for future in concurrent.futures.as_completed(future_to_member):
+                    if self.cancel_event.is_set():
+                        # Cancel all pending tasks
+                        for f in future_to_member:
+                            f.cancel()
+                        break
+                        
+                    member = future_to_member[future]
+                    try:
+                        success = future.result()
+                        if not success:
+                            logger.warning(f"Failed to extract {member.filename}")
+                    except Exception as e:
+                        logger.error(f"Exception while extracting {member.filename}: {e}")
+                        
+                    # Update progress
+                    extracted_files += 1
+                    self.update_progress(extracted_files, total_files)
+                    
+                if self.cancel_event.is_set():
+                    raise InterruptedError("Operation cancelled")
+                
+                # Ensure 100% progress
+                self.update_progress(total_files, total_files)
+                
+        except zipfile.BadZipFile:
+            raise zipfile.BadZipFile(f"The file is not a valid zip archive: {zip_path}")
+        except Exception as e:
+            logger.error(f"Error during parallel extraction: {e}")
+            raise
 
 def run_app():
     """Runs the ZipApp."""
