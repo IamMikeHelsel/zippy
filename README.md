@@ -1,6 +1,4 @@
 # zippy
-# Simple Zip Utility
-
 A simple utility application built with Python and CustomTkinter to compress files/folders into `.zip` archives and uncompress existing `.zip` archives.
 
 ## Features
@@ -45,5 +43,3 @@ This project uses [uv](https://github.com/astral-sh/uv) as the package manager a
 
 With the virtual environment activated, run:
 
-```bash
-zip-app
