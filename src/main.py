@@ -1,4 +1,4 @@
-# src/zip_utility/main.py
+# src/main.py
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
@@ -9,8 +9,8 @@ import psutil
 from pathlib import Path
 import os
 import time
-from . import core
-from . import utils  # Import the new utilities module
+from src import core
+from src import utils  # Import the new utilities module
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -592,9 +592,12 @@ class ZipApp(ctk.CTk):
                     for file in temp_dir.iterdir():
                         try:
                             file.unlink()
-                        except:
-                            pass
-                    temp_dir.rmdir()
+                        except Exception as e:
+                            logger.error(f"Error removing temp file {file}: {e}")
+                    try:
+                        temp_dir.rmdir()
+                    except Exception as e:
+                        logger.error(f"Error removing temp directory {temp_dir}: {e}")
             except Exception as e:
                 logger.error(f"Error cleaning up temp directory: {e}")
     
@@ -647,8 +650,8 @@ class ZipApp(ctk.CTk):
                 # If there are too few files, use the standard extraction method
                 if len(members) < 5:
                     core.uncompress_archive(zip_path, extract_dir, 
-                                          progress_callback=self.update_progress, 
-                                          cancel_event=self.cancel_event)
+                                            progress_callback=self.update_progress, 
+                                            cancel_event=self.cancel_event)
                     return
                     
                 total_files = len(members)

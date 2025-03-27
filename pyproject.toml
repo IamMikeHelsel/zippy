@@ -14,14 +14,11 @@ authors = [
 ]
 dependencies = [
     "customtkinter>=5.2.0", # For the UI
-    "pytest>=8.3.5",
-    "pytest-cov>=6.0.0",
-    "ruff>=0.11.2",
     "psutil>=5.9.5", # For resource monitoring
 ]
 
 [project.scripts]
-zip-app = "zip_utility.main:run_app" # Allows running 'zip-app' after installation
+zip-app = "src.main:run_app" # Allows running 'zip-app' after installation
 
 [project.optional-dependencies]
 test = [
@@ -32,7 +29,7 @@ test = [
 # --- Tool Configurations ---
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/zip_utility"] # Tell hatch where the package source is
+packages = ["src"] # Tell hatch where the package source is
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -46,7 +43,7 @@ pythonpath = ["."]
 source = ["src"] # Specify source for coverage
 
 [tool.coverage.report]
-fail_under = 20 # Temporarily reduced from 80% to allow tests to pass
+fail_under = 70 # Set a higher coverage requirement
 show_missing = true
 
 [tool.uv]
