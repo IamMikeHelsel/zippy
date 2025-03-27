@@ -1,0 +1,64 @@
+[project]
+name = "zippy"
+version = "0.1.0"
+description = "Simple open source compression and decompession tool"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "customtkinter>=5.2.2",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.11.2",
+]
+
+
+# Gemini did this
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zip_utility"
+version = "0.1.0"
+description = "A simple zip/unzip utility with a modern dark UI."
+requires-python = ">=3.13" # As requested, though >=3.8 might suffice for the code
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" },
+]
+dependencies = [
+    "customtkinter>=5.2.0", # For the UI
+]
+
+[project.scripts]
+zip-app = "zip_utility.main:run_app" # Allows running 'zip-app' after installation
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+# --- Tool Configurations ---
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zip_utility"] # Tell hatch where the package source is
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --cov=zip_utility --cov-report=term-missing" # Run tests quietly, show summary, add coverage
+testpaths = [
+    "tests",
+]
+pythonpath = ["src"] # Add src to Python path for tests
+
+[tool.coverage.run]
+source = ["zip_utility"] # Specify source for coverage
+
+[tool.coverage.report]
+fail_under = 80 # Example: Fail if coverage is below 80%
+show_missing = true
+
+[tool.uv]
+# You can add uv-specific configurations here if needed in the future
