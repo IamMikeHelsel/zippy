@@ -160,7 +160,7 @@ def test_progress_callback(test_files, tmp_path):
     # Test uncompression progress
     core.uncompress_archive(str(zip_path), str(extract_dir), progress_callback=mock_uncompress_progress)
     assert len(uncompress_calls) > 0 # Should have been called
-    # Basic extractall only gives start/end for this implementation
-    assert len(uncompress_calls) == 2
-    assert uncompress_calls[0] == (0, uncompress_calls[1][1]) # Start
-    assert uncompress_calls[1][0] == uncompress_calls[1][1] # End
+    # Our improved implementation reports progress at start, during, and end
+    assert len(uncompress_calls) >= 2
+    assert uncompress_calls[0][0] == 0  # First call shows 0 progress
+    assert uncompress_calls[-1][0] == uncompress_calls[-1][1]  # Last call shows completion

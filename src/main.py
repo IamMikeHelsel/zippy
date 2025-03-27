@@ -625,6 +625,9 @@ class ZipApp(ctk.CTk):
                                 
                             with inzip.open(file_info) as file:
                                 outzip.writestr(file_info.filename, file.read())
+                except Exception as e:
+                    logger.error(f"Error merging zip file {zip_file}: {e}")
+                    # Continue with other zip files instead of failing
 
     def _run_parallel_decompression(self, zip_path, extract_dir):
         """

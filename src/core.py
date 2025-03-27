@@ -1,4 +1,4 @@
-# src/zip_utility/core.py
+# src/core.py
 import zipfile
 import os
 import logging

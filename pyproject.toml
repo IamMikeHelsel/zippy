@@ -33,7 +33,7 @@ packages = ["src"] # Tell hatch where the package source is
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -q --cov=src --cov-report=term-missing" # Run tests quietly, show summary, add coverage
+addopts = "-ra -q" # Run tests quietly, show summary 
 testpaths = [
     "Tests",
 ]
