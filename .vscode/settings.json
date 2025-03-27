@@ -1,0 +1,12 @@
+{
+    "python.testing.pytestArgs": [
+        "Tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "github.copilot.chat.generateTests.codeLens": true,
+    "python.analysis.inlayHints.functionReturnTypes": true,
+    "python.analysis.inlayHints.pytestParameters": true,
+    "python.terminal.shellIntegration.enabled": true,
+    "editor.formatOnSave": true
+}

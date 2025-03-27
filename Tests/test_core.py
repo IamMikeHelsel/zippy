@@ -6,7 +6,7 @@ import os
 import shutil
 
 # Make sure core can be imported: Requires 'src' in pythonpath (configured in pyproject.toml)
-from zip_utility import core
+from src import core
 
 @pytest.fixture
 def test_files(tmp_path):
@@ -74,7 +74,8 @@ def test_compress_directory(test_files, tmp_path):
 
     # Verify contents
     with zipfile.ZipFile(output_zip, 'r') as zipf:
-        # Check relative paths in zip
+        # Check relative paths in zip - normalize path separators for cross-platform compatibility
+        zip_names = set(name.replace('/', os.sep) for name in zipf.namelist())
         expected_names = {
             "file1.txt",
             "toplevel.dat",
@@ -82,7 +83,7 @@ def test_compress_directory(test_files, tmp_path):
             # Note: zipfile typically doesn't store empty directories explicitly
             # unless specifically added. os.walk based approach won't add empty_subdir
         }
-        assert set(zipf.namelist()) == expected_names
+        assert zip_names == expected_names
         zipf.extractall(extract_dir)
 
     # Check extracted structure and content
