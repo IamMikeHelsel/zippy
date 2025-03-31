@@ -2,8 +2,8 @@
 # Main entry point for the zippy application
 import sys
 import logging
-import os
-import traceback
+import os  # noqa: F401
+import traceback  # noqa: F401
 from pathlib import Path
 from datetime import datetime
 

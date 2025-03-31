@@ -25,6 +25,11 @@ test = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
 ]
+build = [
+    "nuitka>=1.8.0",  # For compiling Python to C++
+    "ordered-set>=4.1.0",  # Required by Nuitka
+    "zstandard>=0.21.0",  # For better compression in Nuitka
+]
 
 # --- Tool Configurations ---
 
