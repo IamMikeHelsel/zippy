@@ -6,6 +6,7 @@ import os  # noqa: F401
 import traceback  # noqa: F401
 from pathlib import Path
 from datetime import datetime
+import argparse
 
 # Configure logging before importing any other modules
 def setup_logging():
@@ -53,24 +54,44 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 # Install exception handler
 sys.excepthook = handle_exception
 
-# Initialize logging
-log_file = setup_logging()
-logging.info(f"Application starting. Log file: {log_file}")
-
-try:
-    from src.main import run_app
-
-    def main():
-        try:
-            logging.info("Starting main application")
+def main():
+    parser = argparse.ArgumentParser(description="Zippy - A compression utility")
+    parser.add_argument("--api", action="store_true", help="Run as API server")
+    parser.add_argument("--port", type=int, default=8000, help="Port for API server")
+    parser.add_argument("--gui", action="store_true", help="Run as GUI application")
+    
+    # Parse only known args to handle the mode selection
+    # This allows the rest of the args to be passed to the CLI module
+    args, remaining_args = parser.parse_known_args()
+    
+    # Initialize logging
+    log_file = setup_logging()
+    logging.info(f"Application starting. Log file: {log_file}")
+    
+    try:
+        if args.api:
+            # Run as API server (to be implemented)
+            from src.api import run_api_server
+            logging.info(f"Starting API server on port {args.port}")
+            run_api_server(port=args.port)
+        elif args.gui:
+            # Run as GUI application (existing functionality)
+            from src.app import run_app
+            logging.info("Starting GUI application")
             run_app()
-        except Exception as e:
-            logging.error(f"Error in main application: {e}", exc_info=True)
-            raise
+        else:
+            # Default: Run as CLI application
+            from src.cli import main as cli_main
+            # Reset sys.argv to only the remaining args for the CLI parser
+            sys.argv = [sys.argv[0]] + remaining_args
+            logging.info("Starting CLI application")
+            return cli_main()
+    except Exception as e:
+        logging.critical(f"Failed to start application: {e}", exc_info=True)
+        print(f"Critical error: {e}. See log file: {log_file}", file=sys.stderr)
+        return 1
+    
+    return 0
 
-    if __name__ == "__main__":
-        main()
-except Exception as e:
-    logging.critical(f"Failed to start application: {e}", exc_info=True)
-    print(f"Critical error: {e}. See log file: {log_file}", file=sys.stderr)
-    sys.exit(1)
+if __name__ == "__main__":
+    sys.exit(main())

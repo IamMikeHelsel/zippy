@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # Import the main module from src
-from src import main
+from src import app
 from src import utils
 from src import core
 
@@ -61,7 +61,7 @@ def test_files(tmp_path):
 def app_instance():
     """Create an instance of the ZipApp for testing."""
     with patch('customtkinter.CTk'):
-        app = main.ZipApp()
+        app = app.ZipApp()
         # Mock the UI elements to avoid actual UI operations
         app.update_status = MagicMock()
         app.update_progress = MagicMock()
@@ -362,8 +362,8 @@ def test_update_resource_display(app_instance, monkeypatch):
     cpu_mock = MagicMock()
     cpu_mock.cpu_percent.return_value = 25.3
     
-    monkeypatch.setattr(main.psutil, "virtual_memory", lambda: memory_mock)
-    monkeypatch.setattr(main.psutil, "Process", lambda: cpu_mock)
+    monkeypatch.setattr(app.psutil, "virtual_memory", lambda: memory_mock)
+    monkeypatch.setattr(app.psutil, "Process", lambda: cpu_mock)
     
     # Mock necessary variables
     app_instance.resource_label = MagicMock()
@@ -486,7 +486,7 @@ def test_app_initialization():
          patch('customtkinter.CTkProgressBar'), \
          patch('customtkinter.StringVar'):
         
-        app = main.ZipApp()
+        app = app.ZipApp()
         
         # Verify basic properties were initialized
         assert hasattr(app, 'source_path')

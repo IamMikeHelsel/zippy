@@ -15,6 +15,9 @@ authors = [
 dependencies = [
     "customtkinter>=5.2.0", # For the UI
     "psutil>=5.9.5", # For resource monitoring
+    "fastapi>=0.104.0", # For the API server
+    "uvicorn>=0.23.2", # ASGI server for FastAPI
+    "python-multipart>=0.0.6", # For handling file uploads
 ]
 
 [project.scripts]
