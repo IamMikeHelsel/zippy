@@ -12,8 +12,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any, Union
 
-# Import RAR and 7z support
-import rarfile
+# Import 7z support
 import py7zr
 
 # Import feature flags
@@ -35,7 +34,6 @@ DEFAULT_COMPRESSION_LEVEL = (
 # Supported archive formats
 class ArchiveFormat:
     ZIP = "zip"
-    RAR = "rar"
     SEVEN_ZIP = "7z"
 
 
@@ -60,13 +58,6 @@ def detect_archive_format(file_path: str) -> str:
         if zipfile.is_zipfile(file_path):
             return ArchiveFormat.ZIP
 
-    elif ext == ".rar":
-        try:
-            if rarfile.is_rarfile(file_path):
-                return ArchiveFormat.RAR
-        except Exception as e:
-            logger.warning(f"Error checking RAR format: {e}")
-
     elif ext == ".7z":
         try:
             with py7zr.SevenZipFile(file_path, mode="r"):
@@ -80,12 +71,6 @@ def detect_archive_format(file_path: str) -> str:
     try:
         if zipfile.is_zipfile(file_path):
             return ArchiveFormat.ZIP
-    except:
-        pass
-
-    try:
-        if rarfile.is_rarfile(file_path):
-            return ArchiveFormat.RAR
     except:
         pass
 
@@ -122,8 +107,13 @@ class ResourceMonitor:
         """Stop the resource monitoring thread."""
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._stop_event.set()
-            self._monitor_thread.join(timeout=1.0)
-            logger.debug("Resource monitoring stopped")
+            self._monitor_thread.join(
+                timeout=2.0
+            )  # Increased timeout for reliable joining
+            if self._monitor_thread.is_alive():
+                logger.warning("Resource monitor thread did not terminate properly")
+            else:
+                logger.debug("Resource monitoring stopped")
 
     def _monitor_resources(self):
         """Monitor CPU and memory usage in a separate thread."""
@@ -146,11 +136,19 @@ class ResourceMonitor:
                 logger.debug(f"Memory: {memory_percent}%, CPU: {cpu_percent}%")
 
                 # Sleep for a short interval
-                time.sleep(1.0)
+                # Use a loop with small sleeps to check for stop event more frequently
+                for _ in range(10):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(0.1)  # Sleep in smaller increments to be more responsive
 
             except Exception as e:
                 logger.error(f"Error in resource monitor: {e}")
-                time.sleep(2.0)  # Sleep longer on error
+                # Sleep shorter on error and check for stop event
+                for _ in range(10):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(0.2)
 
     @property
     def is_resource_critical(self) -> bool:
@@ -548,7 +546,7 @@ def uncompress_archive(
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
     """
-    Uncompresses an archive (ZIP, RAR, or 7z) to a specified directory.
+    Uncompresses an archive (ZIP or 7z) to a specified directory.
 
     Args:
         archive_path_str: Path to the archive file to uncompress.
@@ -564,7 +562,6 @@ def uncompress_archive(
         ValueError: If the archive format is not supported
         OSError: For filesystem-related errors (disk full, etc.)
         zipfile.BadZipFile: If there's an issue with the zip format
-        rarfile.Error: If there's an issue with the RAR format
         py7zr.exceptions.Bad7zFile: If there's an issue with the 7z format
     """
     archive_path = Path(archive_path_str).resolve()
@@ -590,8 +587,6 @@ def uncompress_archive(
     try:
         if archive_format == ArchiveFormat.ZIP:
             _uncompress_zip(archive_path, extract_to, progress_callback, cancel_event)
-        elif archive_format == ArchiveFormat.RAR:
-            _uncompress_rar(archive_path, extract_to, progress_callback, cancel_event)
         elif archive_format == ArchiveFormat.SEVEN_ZIP:
             _uncompress_7z(archive_path, extract_to, progress_callback, cancel_event)
         else:
@@ -684,111 +679,6 @@ def _uncompress_zip(
                     else:
                         # Process small file normally
                         zipf.extract(member, path=extract_to)
-
-                extracted_bytes += member.file_size
-
-                # Update progress, but not too frequently
-                current_time = time.time()
-                if progress_callback and (
-                    current_time - last_progress_time > PROGRESS_UPDATE_INTERVAL
-                ):
-                    progress_callback(extracted_bytes, total_uncompressed)
-                    last_progress_time = current_time
-
-            except (PermissionError, OSError) as e:
-                logger.error(f"Error extracting {member.filename}: {e}")
-                # Continue with other files instead of aborting
-
-        # Ensure final progress update
-        if progress_callback:
-            progress_callback(extracted_bytes, total_uncompressed)
-
-
-def _uncompress_rar(
-    rar_path: Path,
-    extract_to: Path,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-    cancel_event: Optional[threading.Event] = None,
-) -> None:
-    """Internal function to handle RAR extraction."""
-    last_progress_time = 0
-
-    if not rarfile.is_rarfile(rar_path):
-        raise rarfile.BadRarFile(f"File is not a valid RAR archive: {rar_path}")
-
-    # Check archive size before opening
-    archive_size = rar_path.stat().st_size
-    logger.info(f"RAR archive size: {archive_size / 1024 / 1024:.1f} MB")
-
-    with rarfile.RarFile(rar_path) as rf:
-        members = rf.infolist()
-        total_files = len(members)
-        logger.info(f"Found {total_files} members in RAR archive")
-
-        # Calculate total uncompressed size
-        total_uncompressed = 0
-        for member in members:
-            total_uncompressed += member.file_size
-
-        logger.info(
-            f"Total uncompressed size: {total_uncompressed / 1024 / 1024:.1f} MB"
-        )
-
-        # Early check for available disk space
-        free_space = psutil.disk_usage(extract_to.as_posix()).free
-        if total_uncompressed > free_space:
-            raise OSError(
-                f"Not enough disk space. Need {total_uncompressed / 1024 / 1024:.1f} MB, "
-                f"but only {free_space / 1024 / 1024:.1f} MB available"
-            )
-
-        # Report initial progress
-        if progress_callback:
-            progress_callback(0, total_uncompressed)
-
-        # Extract files
-        extracted_bytes = 0
-        for i, member in enumerate(members):
-            # Check for cancellation
-            if cancel_event and cancel_event.is_set():
-                logger.info("RAR extraction cancelled by user")
-                raise InterruptedError("Operation cancelled by user")
-
-            # Check resource usage
-            if resource_monitor.is_resource_critical:
-                logger.warning("System resources critical, interrupting operation")
-                raise MemoryError("System memory usage is too high, operation aborted")
-
-            try:
-                member_path = Path(member.filename)
-
-                # Handle directories
-                if member.isdir():
-                    dir_path = extract_to / member_path
-                    dir_path.mkdir(parents=True, exist_ok=True)
-                else:
-                    # Handle large files differently
-                    if member.file_size > MAX_FILE_SIZE_IN_MEMORY:
-                        logger.debug(
-                            f"Extracting large RAR file {member.filename} ({member.file_size / 1024 / 1024:.1f} MB)"
-                        )
-                        # Ensure parent directories exist
-                        output_path = extract_to / member_path
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        # Extract in chunks
-                        with (
-                            rf.open(member) as source,
-                            open(output_path, "wb") as target,
-                        ):
-                            while True:
-                                chunk = source.read(CHUNK_SIZE)
-                                if not chunk:
-                                    break
-                                target.write(chunk)
-                    else:
-                        # Use the built-in extraction for normal files
-                        rf.extract(member, path=extract_to)
 
                 extracted_bytes += member.file_size
 
