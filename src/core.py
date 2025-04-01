@@ -8,8 +8,16 @@ import threading
 import io
 import sys
 import concurrent.futures
+import shutil
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any, Union
+
+# Import RAR and 7z support
+import rarfile
+import py7zr
+
+# Import feature flags
+from .feature_flags import feature_flags, FeatureFlag
 
 # Configure a module-level logger
 logger = logging.getLogger(__name__)
@@ -22,6 +30,73 @@ PROGRESS_UPDATE_INTERVAL = 0.5  # Seconds between progress updates
 DEFAULT_COMPRESSION_LEVEL = (
     6  # Balanced compression (0-9, with 0 being no compression and 9 maximum)
 )
+
+
+# Supported archive formats
+class ArchiveFormat:
+    ZIP = "zip"
+    RAR = "rar"
+    SEVEN_ZIP = "7z"
+
+
+def detect_archive_format(file_path: str) -> str:
+    """
+    Detect the archive format based on file extension and validation.
+
+    Args:
+        file_path: Path to the archive file
+
+    Returns:
+        Format string (one of ArchiveFormat constants)
+
+    Raises:
+        ValueError: If the file format is not supported or cannot be detected
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+
+    # Check by extension first
+    if ext == ".zip":
+        if zipfile.is_zipfile(file_path):
+            return ArchiveFormat.ZIP
+
+    elif ext == ".rar":
+        try:
+            if rarfile.is_rarfile(file_path):
+                return ArchiveFormat.RAR
+        except Exception as e:
+            logger.warning(f"Error checking RAR format: {e}")
+
+    elif ext == ".7z":
+        try:
+            with py7zr.SevenZipFile(file_path, mode="r"):
+                return ArchiveFormat.SEVEN_ZIP
+        except py7zr.exceptions.Bad7zFile:
+            pass
+        except Exception as e:
+            logger.warning(f"Error checking 7z format: {e}")
+
+    # If we get here, try more invasive checks regardless of extension
+    try:
+        if zipfile.is_zipfile(file_path):
+            return ArchiveFormat.ZIP
+    except:
+        pass
+
+    try:
+        if rarfile.is_rarfile(file_path):
+            return ArchiveFormat.RAR
+    except:
+        pass
+
+    try:
+        with py7zr.SevenZipFile(file_path, mode="r"):
+            return ArchiveFormat.SEVEN_ZIP
+    except:
+        pass
+
+    # If we get here, format is not supported
+    raise ValueError(f"Unsupported or invalid archive format: {file_path}")
 
 
 class ResourceMonitor:
@@ -174,7 +249,7 @@ def compress_item(
         free_space = psutil.disk_usage(output_zip.parent.as_posix()).free
         if required_space * 0.9 > free_space:  # Allow for some compression
             raise OSError(
-                f"Not enough disk space. Need approximately {required_space/(1024*1024):.1f} MB but only {free_space/(1024*1024):.1f} MB available."
+                f"Not enough disk space. Need approximately {required_space / (1024 * 1024):.1f} MB but only {free_space / (1024 * 1024):.1f} MB available."
             )
     except Exception as e:
         logger.warning(f"Could not perform disk space check: {e}")
@@ -204,7 +279,7 @@ def compress_item(
                 file_size = source_path.stat().st_size
                 if file_size > MAX_FILE_SIZE_IN_MEMORY:
                     logger.info(
-                        f"Large file detected ({file_size/1024/1024:.1f} MB), processing in chunks"
+                        f"Large file detected ({file_size / 1024 / 1024:.1f} MB), processing in chunks"
                     )
                     _compress_large_file(
                         zipf,
@@ -263,7 +338,7 @@ def compress_item(
 
                 total_files = len(files_to_compress)
                 logger.info(
-                    f"Found {total_files} files to compress. Total size: {dir_size/1024/1024:.1f} MB"
+                    f"Found {total_files} files to compress. Total size: {dir_size / 1024 / 1024:.1f} MB"
                 )
 
                 # Early return if no files to compress
@@ -467,116 +542,62 @@ def _add_large_file_to_zip(
 
 
 def uncompress_archive(
-    zip_path_str: str,
+    archive_path_str: str,
     extract_to_str: str,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
     """
-    Uncompresses a zip archive to a specified directory.
+    Uncompresses an archive (ZIP, RAR, or 7z) to a specified directory.
 
     Args:
-        zip_path_str: Path to the zip file to uncompress.
+        archive_path_str: Path to the archive file to uncompress.
         extract_to_str: Path to the directory where files should be extracted.
         progress_callback: Optional function to report progress (current_file_index, total_files).
         cancel_event: Optional event to signal cancellation of the operation.
+
+    Raises:
+        FileNotFoundError: If the archive file doesn't exist
+        PermissionError: If access to archive or destination is denied
+        MemoryError: If system resources are exhausted during operation
+        InterruptedError: If the operation was canceled by the user
+        ValueError: If the archive format is not supported
+        OSError: For filesystem-related errors (disk full, etc.)
+        zipfile.BadZipFile: If there's an issue with the zip format
+        rarfile.Error: If there's an issue with the RAR format
+        py7zr.exceptions.Bad7zFile: If there's an issue with the 7z format
     """
-    zip_path = Path(zip_path_str).resolve()
+    archive_path = Path(archive_path_str).resolve()
     extract_to = Path(extract_to_str).resolve()
     last_progress_time = 0
 
-    if not zip_path.is_file():
-        raise FileNotFoundError(f"Zip archive not found: {zip_path}")
-    if not zipfile.is_zipfile(zip_path):
-        raise zipfile.BadZipFile(f"File is not a valid zip archive: {zip_path}")
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Archive file not found: {archive_path}")
 
-    # Check archive size before opening
-    archive_size = zip_path.stat().st_size
-    logger.info(f"Archive size: {archive_size/1024/1024:.1f} MB")
+    # Detect archive format
+    try:
+        archive_format = detect_archive_format(str(archive_path))
+        logger.info(f"Detected archive format: {archive_format}")
+    except ValueError as e:
+        raise ValueError(f"Invalid or unsupported archive format: {e}")
 
-    extract_to.mkdir(parents=True, exist_ok=True)  # Ensure extraction directory exists
+    # Create extraction directory if it doesn't exist
+    extract_to.mkdir(parents=True, exist_ok=True)
 
     # Start monitoring system resources
     resource_monitor.start()
 
     try:
-        with zipfile.ZipFile(zip_path, "r") as zipf:
-            members = zipf.infolist()
-            total_files = len(members)
-            logger.info(f"Found {total_files} members in archive")
+        if archive_format == ArchiveFormat.ZIP:
+            _uncompress_zip(archive_path, extract_to, progress_callback, cancel_event)
+        elif archive_format == ArchiveFormat.RAR:
+            _uncompress_rar(archive_path, extract_to, progress_callback, cancel_event)
+        elif archive_format == ArchiveFormat.SEVEN_ZIP:
+            _uncompress_7z(archive_path, extract_to, progress_callback, cancel_event)
+        else:
+            raise ValueError(f"Unsupported archive format: {archive_format}")
 
-            # Calculate total uncompressed size
-            total_uncompressed = 0
-            for member in members:
-                total_uncompressed += member.file_size
-
-            logger.info(
-                f"Total uncompressed size: {total_uncompressed/1024/1024:.1f} MB"
-            )
-
-            # Early check for available disk space
-            free_space = psutil.disk_usage(extract_to.as_posix()).free
-            if total_uncompressed > free_space:
-                raise OSError(
-                    f"Not enough disk space. Need {total_uncompressed/1024/1024:.1f} MB, "
-                    f"but only {free_space/1024/1024:.1f} MB available"
-                )
-
-            # Report initial progress
-            if progress_callback:
-                progress_callback(0, total_uncompressed)
-
-            # Extract file by file for better progress tracking and resource management
-            extracted_bytes = 0
-            for i, member in enumerate(members):
-                # Check for cancellation
-                if cancel_event and cancel_event.is_set():
-                    logger.info("Extraction cancelled by user")
-                    raise InterruptedError("Operation cancelled by user")
-
-                # Check resource usage
-                if resource_monitor.is_resource_critical:
-                    logger.warning("System resources critical, interrupting operation")
-                    raise MemoryError(
-                        "System memory usage is too high, operation aborted"
-                    )
-
-                try:
-                    # Extract the file
-                    if member.is_dir():
-                        # Create directory if it doesn't exist
-                        dir_path = extract_to / member.filename
-                        dir_path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        # Process large files specially
-                        if member.file_size > MAX_FILE_SIZE_IN_MEMORY:
-                            logger.debug(
-                                f"Extracting large file {member.filename} ({member.file_size/1024/1024:.1f} MB)"
-                            )
-                            _extract_large_file(zipf, member, extract_to)
-                        else:
-                            # Process small file normally
-                            zipf.extract(member, path=extract_to)
-
-                    extracted_bytes += member.file_size
-
-                    # Update progress, but not too frequently
-                    current_time = time.time()
-                    if progress_callback and (
-                        current_time - last_progress_time > PROGRESS_UPDATE_INTERVAL
-                    ):
-                        progress_callback(extracted_bytes, total_uncompressed)
-                        last_progress_time = current_time
-
-                except (PermissionError, OSError) as e:
-                    logger.error(f"Error extracting {member.filename}: {e}")
-                    # Continue with other files instead of aborting
-
-            # Ensure final progress update
-            if progress_callback:
-                progress_callback(extracted_bytes, total_uncompressed)
-
-            logger.info("Extraction complete.")
+        logger.info("Extraction complete.")
 
     except (MemoryError, InterruptedError) as e:
         # Handle special exceptions
@@ -592,19 +613,641 @@ def uncompress_archive(
         resource_monitor.stop()
 
 
-def _extract_large_file(
-    zipf: zipfile.ZipFile, member: zipfile.ZipInfo, extract_to: Path
+def _uncompress_zip(
+    zip_path: Path,
+    extract_to: Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    """Extract a large file in chunks to avoid memory issues."""
-    target_path = extract_to / member.filename
+    """Internal function to handle ZIP extraction."""
+    last_progress_time = 0
 
-    # Create parent directories if they don't exist
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if not zipfile.is_zipfile(zip_path):
+        raise zipfile.BadZipFile(f"File is not a valid zip archive: {zip_path}")
+
+    # Check archive size before opening
+    archive_size = zip_path.stat().st_size
+    logger.info(f"Archive size: {archive_size / 1024 / 1024:.1f} MB")
+
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        members = zipf.infolist()
+        total_files = len(members)
+        logger.info(f"Found {total_files} members in archive")
+
+        # Calculate total uncompressed size
+        total_uncompressed = 0
+        for member in members:
+            total_uncompressed += member.file_size
+
+        logger.info(
+            f"Total uncompressed size: {total_uncompressed / 1024 / 1024:.1f} MB"
+        )
+
+        # Early check for available disk space
+        free_space = psutil.disk_usage(extract_to.as_posix()).free
+        if total_uncompressed > free_space:
+            raise OSError(
+                f"Not enough disk space. Need {total_uncompressed / 1024 / 1024:.1f} MB, "
+                f"but only {free_space / 1024 / 1024:.1f} MB available"
+            )
+
+        # Report initial progress
+        if progress_callback:
+            progress_callback(0, total_uncompressed)
+
+        # Extract file by file for better progress tracking and resource management
+        extracted_bytes = 0
+        for i, member in enumerate(members):
+            # Check for cancellation
+            if cancel_event and cancel_event.is_set():
+                logger.info("Extraction cancelled by user")
+                raise InterruptedError("Operation cancelled by user")
+
+            # Check resource usage
+            if resource_monitor.is_resource_critical:
+                logger.warning("System resources critical, interrupting operation")
+                raise MemoryError("System memory usage is too high, operation aborted")
+
+            try:
+                # Extract the file
+                if member.is_dir():
+                    # Create directory if it doesn't exist
+                    dir_path = extract_to / member.filename
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    # Process large files specially
+                    if member.file_size > MAX_FILE_SIZE_IN_MEMORY:
+                        logger.debug(
+                            f"Extracting large file {member.filename} ({member.file_size / 1024 / 1024:.1f} MB)"
+                        )
+                        _extract_large_file(zipf, member, extract_to)
+                    else:
+                        # Process small file normally
+                        zipf.extract(member, path=extract_to)
+
+                extracted_bytes += member.file_size
+
+                # Update progress, but not too frequently
+                current_time = time.time()
+                if progress_callback and (
+                    current_time - last_progress_time > PROGRESS_UPDATE_INTERVAL
+                ):
+                    progress_callback(extracted_bytes, total_uncompressed)
+                    last_progress_time = current_time
+
+            except (PermissionError, OSError) as e:
+                logger.error(f"Error extracting {member.filename}: {e}")
+                # Continue with other files instead of aborting
+
+        # Ensure final progress update
+        if progress_callback:
+            progress_callback(extracted_bytes, total_uncompressed)
+
+
+def _uncompress_rar(
+    rar_path: Path,
+    extract_to: Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """Internal function to handle RAR extraction."""
+    last_progress_time = 0
+
+    if not rarfile.is_rarfile(rar_path):
+        raise rarfile.BadRarFile(f"File is not a valid RAR archive: {rar_path}")
+
+    # Check archive size before opening
+    archive_size = rar_path.stat().st_size
+    logger.info(f"RAR archive size: {archive_size / 1024 / 1024:.1f} MB")
+
+    with rarfile.RarFile(rar_path) as rf:
+        members = rf.infolist()
+        total_files = len(members)
+        logger.info(f"Found {total_files} members in RAR archive")
+
+        # Calculate total uncompressed size
+        total_uncompressed = 0
+        for member in members:
+            total_uncompressed += member.file_size
+
+        logger.info(
+            f"Total uncompressed size: {total_uncompressed / 1024 / 1024:.1f} MB"
+        )
+
+        # Early check for available disk space
+        free_space = psutil.disk_usage(extract_to.as_posix()).free
+        if total_uncompressed > free_space:
+            raise OSError(
+                f"Not enough disk space. Need {total_uncompressed / 1024 / 1024:.1f} MB, "
+                f"but only {free_space / 1024 / 1024:.1f} MB available"
+            )
+
+        # Report initial progress
+        if progress_callback:
+            progress_callback(0, total_uncompressed)
+
+        # Extract files
+        extracted_bytes = 0
+        for i, member in enumerate(members):
+            # Check for cancellation
+            if cancel_event and cancel_event.is_set():
+                logger.info("RAR extraction cancelled by user")
+                raise InterruptedError("Operation cancelled by user")
+
+            # Check resource usage
+            if resource_monitor.is_resource_critical:
+                logger.warning("System resources critical, interrupting operation")
+                raise MemoryError("System memory usage is too high, operation aborted")
+
+            try:
+                member_path = Path(member.filename)
+
+                # Handle directories
+                if member.isdir():
+                    dir_path = extract_to / member_path
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    # Handle large files differently
+                    if member.file_size > MAX_FILE_SIZE_IN_MEMORY:
+                        logger.debug(
+                            f"Extracting large RAR file {member.filename} ({member.file_size / 1024 / 1024:.1f} MB)"
+                        )
+                        # Ensure parent directories exist
+                        output_path = extract_to / member_path
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Extract in chunks
+                        with (
+                            rf.open(member) as source,
+                            open(output_path, "wb") as target,
+                        ):
+                            while True:
+                                chunk = source.read(CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                target.write(chunk)
+                    else:
+                        # Use the built-in extraction for normal files
+                        rf.extract(member, path=extract_to)
+
+                extracted_bytes += member.file_size
+
+                # Update progress, but not too frequently
+                current_time = time.time()
+                if progress_callback and (
+                    current_time - last_progress_time > PROGRESS_UPDATE_INTERVAL
+                ):
+                    progress_callback(extracted_bytes, total_uncompressed)
+                    last_progress_time = current_time
+
+            except (PermissionError, OSError) as e:
+                logger.error(f"Error extracting {member.filename}: {e}")
+                # Continue with other files instead of aborting
+
+        # Ensure final progress update
+        if progress_callback:
+            progress_callback(extracted_bytes, total_uncompressed)
+
+
+def _uncompress_7z(
+    seven_zip_path: Path,
+    extract_to: Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """Internal function to handle 7z extraction."""
+    last_progress_time = 0
+
+    # Check archive size
+    archive_size = seven_zip_path.stat().st_size
+    logger.info(f"7z archive size: {archive_size / 1024 / 1024:.1f} MB")
+
+    try:
+        with py7zr.SevenZipFile(seven_zip_path, mode="r") as z:
+            # Get archive information
+            archive_info = z.archiveinfo()
+            total_uncompressed = archive_info.uncompressed
+
+            logger.info(
+                f"7z archive: {len(z.files)} files, "
+                f"uncompressed size: {total_uncompressed / 1024 / 1024:.1f} MB"
+            )
+
+            # Early check for available disk space
+            free_space = psutil.disk_usage(extract_to.as_posix()).free
+            if total_uncompressed > free_space:
+                raise OSError(
+                    f"Not enough disk space. Need {total_uncompressed / 1024 / 1024:.1f} MB, "
+                    f"but only {free_space / 1024 / 1024:.1f} MB available"
+                )
+
+            # Report initial progress
+            if progress_callback:
+                progress_callback(0, total_uncompressed)
+
+            # The py7zr doesn't provide a way to extract file by file with progress
+            # We need to extract everything at once and then monitor the progress by checking
+            # the extracted files' sizes periodically
+
+            # We'll extract to a temporary directory first, to handle progress reporting
+            with tempfile.TemporaryDirectory() as temp_dir:
+                extract_thread = threading.Thread(
+                    target=lambda: z.extractall(path=temp_dir)
+                )
+                extract_thread.start()
+
+                # Monitor extraction progress
+                while extract_thread.is_alive():
+                    # Check for cancellation
+                    if cancel_event and cancel_event.is_set():
+                        # We can't directly cancel extraction, so we'll have to let it finish
+                        # and then not copy the files over
+                        logger.info(
+                            "7z extraction cancellation requested, waiting for extract thread"
+                        )
+                        extract_thread.join()
+                        raise InterruptedError("Operation cancelled by user")
+
+                    # Check resource usage
+                    if resource_monitor.is_resource_critical:
+                        # Same issue as above, we'll wait for the thread to finish
+                        logger.warning(
+                            "System resources critical, waiting for extract thread"
+                        )
+                        extract_thread.join()
+                        raise MemoryError(
+                            "System memory usage is too high, operation aborted"
+                        )
+
+                    # Estimate progress by checking extracted files
+                    current_extracted_size = 0
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            try:
+                                current_extracted_size += os.path.getsize(
+                                    os.path.join(root, file)
+                                )
+                            except (OSError, FileNotFoundError):
+                                pass
+
+                    # Update progress
+                    current_time = time.time()
+                    if progress_callback and (
+                        current_time - last_progress_time > PROGRESS_UPDATE_INTERVAL
+                    ):
+                        # Cap at total_uncompressed to avoid showing >100%
+                        current_extracted_size = min(
+                            current_extracted_size, total_uncompressed
+                        )
+                        progress_callback(current_extracted_size, total_uncompressed)
+                        last_progress_time = current_time
+
+                    # Sleep briefly before checking again
+                    time.sleep(0.1)
+
+                # Extraction complete, copy files to final destination
+                for item in os.listdir(temp_dir):
+                    src_path = os.path.join(temp_dir, item)
+                    dst_path = os.path.join(extract_to, item)
+
+                    if os.path.isdir(src_path):
+                        if os.path.exists(dst_path):
+                            shutil.rmtree(dst_path)
+                        shutil.copytree(src_path, dst_path)
+                    else:
+                        shutil.copy2(src_path, dst_path)
+
+            # Ensure final progress update
+            if progress_callback:
+                progress_callback(total_uncompressed, total_uncompressed)
+
+    except py7zr.exceptions.Bad7zFile as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error extracting 7z archive: {e}")
+        raise
+
+
+def _extract_large_file(
+    zipf: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    extract_to: Path,
+) -> None:
+    """Extract a large file from a zip archive in chunks."""
+    # Create parent directories as needed
+    output_path = extract_to / member.filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Extract the file in chunks
-    with zipf.open(member) as source, open(target_path, "wb") as target:
-        while True:
-            chunk = source.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            target.write(chunk)
+    with zipf.open(member) as source, open(output_path, "wb") as target:
+        shutil.copyfileobj(source, target, CHUNK_SIZE)
+
+
+def compress_items_parallel(
+    source_paths: List[str],
+    output_zip_str: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    compression_level: int = DEFAULT_COMPRESSION_LEVEL,
+    max_workers: int = None,
+) -> None:
+    """
+    Compress multiple items in parallel using feature flag-controlled parallel compression.
+
+    This function is used when the PARALLEL_COMPRESSION feature flag is enabled.
+    It compresses multiple files or directories in parallel for better performance.
+
+    Args:
+        source_paths: List of paths to files or directories to compress
+        output_zip_str: Path where the output zip file should be saved
+        progress_callback: Optional function to report progress
+        cancel_event: Optional event to signal cancellation
+        compression_level: Compression level (0-9)
+        max_workers: Maximum number of worker threads (None = CPU count)
+
+    Raises:
+        Various exceptions as in compress_item()
+    """
+    output_zip = Path(output_zip_str).resolve()
+    total_size = 0
+    files_to_compress = []
+
+    # First, gather information about all files to compress
+    logger.info(f"Scanning {len(source_paths)} source paths for parallel compression")
+
+    for source_path_str in source_paths:
+        source_path = Path(source_path_str).resolve()
+
+        if not source_path.exists():
+            logger.warning(f"Source path not found, skipping: {source_path}")
+            continue
+
+        if source_path.is_file():
+            try:
+                file_size = source_path.stat().st_size
+                total_size += file_size
+                files_to_compress.append((source_path, source_path.name, file_size))
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Could not access file {source_path}: {e}")
+
+        elif source_path.is_dir():
+            # Scan directory recursively
+            for root, _, files in os.walk(source_path):
+                for file in files:
+                    file_path = Path(root) / file
+                    try:
+                        file_size = file_path.stat().st_size
+                        # Calculate path relative to the source directory
+                        rel_path = file_path.relative_to(source_path)
+                        total_size += file_size
+                        files_to_compress.append((file_path, rel_path, file_size))
+                    except (PermissionError, OSError) as e:
+                        logger.warning(f"Could not access file {file_path}: {e}")
+
+    if not files_to_compress:
+        logger.warning("No files to compress")
+        if progress_callback:
+            progress_callback(0, 0)
+        return
+
+    logger.info(
+        f"Found {len(files_to_compress)} files to compress. Total size: {total_size / 1024 / 1024:.1f} MB"
+    )
+
+    # Determine the number of workers
+    if max_workers is None:
+        max_workers = min(
+            32, os.cpu_count() + 4
+        )  # Standard formula for I/O-bound tasks
+
+    # Start monitoring system resources
+    resource_monitor.start()
+
+    try:
+        # Create zipfile with the specified compression level
+        with zipfile.ZipFile(
+            output_zip,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=compression_level,
+        ) as zipf:
+            # Use a lock to synchronize access to the zip file
+            zip_lock = threading.Lock()
+            processed_bytes = 0
+            processed_lock = threading.Lock()
+
+            def compress_file(file_info):
+                nonlocal processed_bytes
+                file_path, arc_name, file_size = file_info
+
+                # Check for cancellation
+                if cancel_event and cancel_event.is_set():
+                    return False
+
+                try:
+                    with zip_lock:
+                        # Add the file to the zip
+                        if file_size > MAX_FILE_SIZE_IN_MEMORY:
+                            # For large files, use the chunked approach
+                            with open(file_path, "rb") as f:
+                                # Create a ZipInfo object
+                                zinfo = zipfile.ZipInfo.from_file(
+                                    file_path, arcname=str(arc_name)
+                                )
+                                zinfo.compress_type = zipfile.ZIP_DEFLATED
+
+                                # Open the entry for writing
+                                with zipf.open(zinfo, "w") as dest:
+                                    while True:
+                                        chunk = f.read(CHUNK_SIZE)
+                                        if not chunk:
+                                            break
+                                        dest.write(chunk)
+                        else:
+                            # For small files, add directly
+                            zipf.write(file_path, arcname=str(arc_name))
+
+                    # Update progress
+                    with processed_lock:
+                        processed_bytes += file_size
+                        if progress_callback:
+                            progress_callback(processed_bytes, total_size)
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"Error compressing {file_path}: {e}")
+                    return False
+
+            # Report initial progress
+            if progress_callback:
+                progress_callback(0, total_size)
+
+            # Use a thread pool to compress files in parallel
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                # Submit all tasks
+                future_to_file = {
+                    executor.submit(compress_file, file_info): file_info
+                    for file_info in files_to_compress
+                }
+
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_file):
+                    if cancel_event and cancel_event.is_set():
+                        # Cancel all remaining tasks
+                        for f in future_to_file:
+                            f.cancel()
+                        raise InterruptedError("Operation cancelled by user")
+
+                    file_path = future_to_file[future][0]
+                    try:
+                        success = future.result()
+                        if not success:
+                            logger.warning(f"Failed to compress {file_path}")
+                    except Exception as e:
+                        logger.error(f"Exception while compressing {file_path}: {e}")
+
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("Operation cancelled by user")
+
+                # Ensure final progress update
+                if progress_callback:
+                    progress_callback(total_size, total_size)
+
+            logger.info(
+                f"Parallel compression complete. Processed {len(files_to_compress)} files."
+            )
+
+    except (MemoryError, InterruptedError) as e:
+        # Handle special exceptions
+        logger.error(f"Compression aborted: {e}")
+        _cleanup_output_file(output_zip)
+        raise
+    except Exception as e:
+        logger.error(f"Parallel compression failed: {e}", exc_info=True)
+        _cleanup_output_file(output_zip)
+        raise
+    finally:
+        # Stop resource monitoring
+        resource_monitor.stop()
+
+
+def compress_with_feature_flags(
+    source_paths: Union[str, List[str]],
+    output_zip: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    compression_level: Optional[int] = None,
+) -> None:
+    """
+    Compress files/directories using the appropriate compression method based on feature flags.
+
+    This function delegates to either the standard compression or parallel compression
+    based on enabled feature flags and configuration.
+
+    Args:
+        source_paths: Path or list of paths to compress
+        output_zip: Output zip file path
+        progress_callback: Optional function to report progress
+        cancel_event: Optional event to signal cancellation
+        compression_level: Optional compression level (uses config value if None)
+    """
+    # If compression_level is not specified, use the one from config
+    if compression_level is None:
+        from .config import config
+
+        compression_level = config.get(
+            "compression", "default_level", DEFAULT_COMPRESSION_LEVEL
+        )
+
+    # Convert single path to list
+    if isinstance(source_paths, str):
+        source_paths = [source_paths]
+
+    # Check if deep inspection feature is enabled
+    if feature_flags.is_enabled(FeatureFlag.DEEP_INSPECTION):
+        logger.info("Deep inspection feature enabled, performing additional validation")
+        # Validate paths more thoroughly
+        validated_paths = []
+        for path in source_paths:
+            try:
+                test_path = Path(path)
+                if not test_path.exists():
+                    logger.warning(f"Path not found, skipping: {path}")
+                    continue
+
+                # Additional validations could be added here
+                validated_paths.append(path)
+            except Exception as e:
+                logger.error(f"Error validating path {path}: {e}")
+
+        # Update source_paths to only include valid paths
+        source_paths = validated_paths
+
+    # Use memory-optimized settings if enabled
+    if feature_flags.is_enabled(FeatureFlag.MEMORY_OPTIMIZED):
+        logger.info("Memory optimization feature enabled")
+        global MAX_FILE_SIZE_IN_MEMORY, CHUNK_SIZE
+        # Use more conservative memory limits when memory optimization is enabled
+        MAX_FILE_SIZE_IN_MEMORY = 100 * 1024 * 1024  # 100MB instead of 500MB
+        CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks instead of 8MB
+
+    # Check if parallel compression should be used
+    if (
+        feature_flags.is_enabled(FeatureFlag.PARALLEL_COMPRESSION)
+        and len(source_paths) > 1
+    ):
+        logger.info("Using parallel compression for multiple items")
+        compress_items_parallel(
+            source_paths, output_zip, progress_callback, cancel_event, compression_level
+        )
+    else:
+        # Use regular compression for single items or when parallel compression is disabled
+        if len(source_paths) == 1:
+            logger.info("Compressing single item using standard compression")
+            compress_item(
+                source_paths[0],
+                output_zip,
+                progress_callback,
+                cancel_event,
+                compression_level,
+            )
+        else:
+            logger.info("Compressing multiple items sequentially")
+            # Process multiple paths sequentially
+            from tempfile import TemporaryDirectory
+            import shutil
+
+            # Create a temporary directory for flattening sources
+            with TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+
+                # Copy all source paths to temp directory
+                for i, source_path in enumerate(source_paths):
+                    src_path = Path(source_path)
+                    if src_path.is_dir():
+                        # Copy directory with unique name
+                        dst_path = temp_path / src_path.name
+                        # If path already exists, add a unique suffix
+                        if dst_path.exists():
+                            dst_path = temp_path / f"{src_path.name}_{i}"
+                        shutil.copytree(src_path, dst_path)
+                    else:
+                        # Copy file, ensuring unique name
+                        dst_path = temp_path / src_path.name
+                        if dst_path.exists():
+                            dst_path = (
+                                temp_path / f"{src_path.stem}_{i}{src_path.suffix}"
+                            )
+                        shutil.copy2(src_path, dst_path)
+
+                # Compress the temporary directory
+                compress_item(
+                    str(temp_path),
+                    output_zip,
+                    progress_callback,
+                    cancel_event,
+                    compression_level,
+                )

@@ -18,6 +18,8 @@ dependencies = [
     "fastapi>=0.104.0", # For the API server
     "uvicorn>=0.23.2", # ASGI server for FastAPI
     "python-multipart>=0.0.6", # For handling file uploads
+    "rarfile>=4.0", # For RAR file support
+    "py7zr>=0.20.5", # For 7z file support
 ]
 
 [project.scripts]
